@@ -57,13 +57,20 @@ def sigmoid_ce_loss(
 
 class EvfSamModel(PreTrainedModel):
     config_class = EvfConfig
+    
+    @property
+    def all_tied_weights_keys(self):
+        keys = getattr(self, "_tied_weights_keys", None)
+        if not keys: return {}
+        if isinstance(keys, list): return {k: None for k in keys}
+        return keys
+        
     def __init__(
         self,
         config,
         **kwargs
     ):
         super(EvfSamModel, self).__init__(config)
-        self.all_tied_weights_keys = {}
 
         self.config = config
         self.vision_pretrained = kwargs.get("vision_pretrained", None)

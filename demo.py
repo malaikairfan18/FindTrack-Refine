@@ -15,7 +15,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-def segment_video(video_path, prompt, gpu, clip_mode='mask_crop', w_finder=0.5, w_clip=0.5):
+def segment_video(video_path, prompt, gpu):
 
     # GPU setting
     torch.cuda.set_device(int(gpu))
@@ -67,7 +67,7 @@ def segment_video(video_path, prompt, gpu, clip_mode='mask_crop', w_finder=0.5, 
         # per-frame mask prediction
         ref_masks = []
         ref_scores = []
-        ref_num = 5
+        ref_num = 10
         for ref_idx in range(ref_num):
             i = int(ref_idx * (video_len - 1) / (ref_num - 1))
             words = tokenizer(prompt, return_tensors='pt')['input_ids'].cuda()
@@ -76,13 +76,14 @@ def segment_video(video_path, prompt, gpu, clip_mode='mask_crop', w_finder=0.5, 
             ref_masks.append(ref_mask)
 
             # consider vision-text alignment in addition to segmentation confidence
-            w1, w2 = float(w_finder), float(w_clip)
+            w1, w2 = 0.5, 0.5
             clip_text = alphaclip.tokenize([prompt]).cuda()
-            clip_sim = compute_clip_similarity(
-                clip, clip_preprocess, clip_preprocess_mask,
-                frames[i], ref_mask, clip_text, mode=clip_mode
-            )
-            ref_score = w1 * ref_score + w2 * clip_sim
+            alpha = clip_preprocess_mask(ref_mask).cuda()
+            image_features = clip.visual(imgs_clip[i].unsqueeze(0).cuda(), alpha.unsqueeze(0))
+            text_features = clip.encode_text(clip_text)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            ref_score = w1 * ref_score + w2 * torch.matmul(image_features, text_features.transpose(0, 1))[0]
             ref_scores.append(ref_score)
 
         # select reference frame with highest mask score
@@ -152,20 +153,13 @@ def segment_video(video_path, prompt, gpu, clip_mode='mask_crop', w_finder=0.5, 
 # gradio setting
 demo = gr.Interface(
     fn=segment_video,
-    inputs=[
-        gr.Video(label='Input Video'), 
-        gr.Text(label='Text Prompt'), 
-        gr.Text(label='GPU Number', value='0'),
-        gr.Dropdown(choices=['mask_crop', 'object_box_crop', 'full_frame'], value='mask_crop', label='CLIP Reranker Mode'),
-        gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.1, label='Finder Score Weight (w1)'),
-        gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.1, label='CLIP Score Weight (w2)')
-    ],
+    inputs=[gr.Video(label='Input Video'), gr.Text(label='Text Prompt'), gr.Text(label='GPU Number')],
     outputs=gr.Video(label='Output Mask'),
     title='FindTrack Demo Page',
     examples=[
-        ['sample/agility.mp4', 'A dog running on grass.', '0', 'mask_crop', 0.5, 0.5],
-        ['sample/elon.mp4', 'Elon Musk dancing in a suit.', '0', 'mask_crop', 0.5, 0.5],
-        ['sample/trump.mp4', 'Donald Trump dancing and clapping in front of an audience.', '0', 'mask_crop', 0.5, 0.5]
+        ['sample/agility.mp4', 'A dog running on grass.', 0],
+        ['sample/elon.mp4', 'Elon Musk dancing in a suit.', 0],
+        ['sample/trump.mp4', 'Donald Trump dancing and clapping in front of an audience.', 0]
     ],
     allow_flagging="never"
 )

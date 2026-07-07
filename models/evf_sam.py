@@ -57,6 +57,14 @@ def sigmoid_ce_loss(
 
 class EvfSamModel(PreTrainedModel):
     config_class = EvfConfig
+    
+    @property
+    def all_tied_weights_keys(self):
+        keys = getattr(self, "_tied_weights_keys", None)
+        if not keys: return {}
+        if isinstance(keys, list): return {k: None for k in keys}
+        return keys
+        
     def __init__(
         self,
         config,
@@ -72,6 +80,13 @@ class EvfSamModel(PreTrainedModel):
         self.train_mask_decoder = True #kwargs.get("train_mask_decoder", False)
         self.train_prompt_encoder = True #kwargs.get("train_prompt_encoder", False)
         self.initialize_evf_modules(config)
+
+        # DINOv2 Fusion (Pipeline 1)
+        self.use_dinov2_fusion = getattr(config, "use_dinov2_fusion", True)
+        self.dinov2_fusion_type = getattr(config, "dinov2_fusion_type", "concat")
+        if self.use_dinov2_fusion:
+            from pipelines.pipeline1 import DinoV2Fusion
+            self.dinov2_fusion = DinoV2Fusion(fusion_type=self.dinov2_fusion_type)
 
 
     def initialize_evf_modules(self, config):
@@ -151,6 +166,8 @@ class EvfSamModel(PreTrainedModel):
         **kwargs,
     ):
         image_embeddings = self.get_visual_embs(images)
+        if self.use_dinov2_fusion:
+            image_embeddings = self.dinov2_fusion(image_embeddings, images_evf)
         batch_size = image_embeddings.shape[0]
         #assert batch_size == len(offset) - 1
 
@@ -265,6 +282,8 @@ class EvfSamModel(PreTrainedModel):
         ):
         with torch.no_grad():
             image_embeddings = self.visual_model.image_encoder(images)
+            if self.use_dinov2_fusion:
+                image_embeddings = self.dinov2_fusion(image_embeddings, images_evf)
         multimask_output = multimask_output
 
         output = self.mm_extractor.beit3(visual_tokens=images_evf, textual_tokens=input_ids, text_padding_position=torch.zeros_like(input_ids))
