@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import timm
 
 class DinoV2Fusion(nn.Module):
-    def __init__(self, fusion_type='concat', dinov2_model_name='vit_small_patch14_dinov2', sam_embed_dim=256):
+    def __init__(self, fusion_type='concat', dinov2_model_name='vit_small_patch14_dinov2.lvd142m', sam_embed_dim=256):
         """
         DINOv2 Feature Fusion module for Pipeline 1.
         Fuses DINOv2 visual features with SAM's visual embeddings.
