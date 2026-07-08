@@ -1,64 +1,43 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 
 class DinoV2Fusion(nn.Module):
-    def __init__(self, fusion_type='concat', dinov2_model_name='vit_small_patch14_dinov2.lvd142m', sam_embed_dim=256):
+    def __init__(self, fusion_type='weighted_sum', dinov2_model_name='vit_small_patch14_dinov2.lvd142m', sam_embed_dim=256):
         """
-        DINOv2 Feature Fusion module for Pipeline 1.
+        DINOv2 Feature Fusion module for Pipeline 1 (Parameter-free / Training-free).
         Fuses DINOv2 visual features with SAM's visual embeddings.
         
         Args:
-            fusion_type (str): 'concat', 'weighted_sum', or 'cross_attention'.
-            dinov2_model_name (str): Timm model name for DINOv2.
+            fusion_type (str): Ignored, kept for API compatibility.
+            dinov2_model_name (str): Ignored, kept for API compatibility.
             sam_embed_dim (int): Embedding dimension of SAM (usually 256).
         """
         super(DinoV2Fusion, self).__init__()
-        self.fusion_type = fusion_type
+        self.sam_embed_dim = sam_embed_dim
         
-        # 1. Initialize DINOv2 backbone
-        print(f"Initializing DINOv2 backbone: {dinov2_model_name} with fusion type: {fusion_type}")
-        self.dinov2 = timm.create_model(dinov2_model_name, pretrained=True)
-        
-        # Freeze DINOv2 weights to avoid gradient calculation/backprop overhead
+        # Load DINOv2 via torch.hub (independent of local timm version)
+        print("Loading DINOv2 model via torch.hub: facebookresearch/dinov2 -> dinov2_vits14")
+        self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
         for param in self.dinov2.parameters():
             param.requires_grad = False
-            
-        dinov2_embed_dim = self.dinov2.embed_dim # 384 for vit_small, 768 for vit_base
-        
-        # 2. Projection layer to project DINOv2 features to 256 channels (sam_embed_dim)
-        self.dinov2_proj = nn.Conv2d(in_channels=dinov2_embed_dim, out_channels=sam_embed_dim, kernel_size=1)
-        
-        # 3. Fusion components depending on fusion_type
-        if fusion_type == 'concat':
-            # Fuses concatenated features of shape [B, 512, 64, 64] back to [B, 256, 64, 64]
-            self.fusion_layer = nn.Conv2d(in_channels=sam_embed_dim * 2, out_channels=sam_embed_dim, kernel_size=1)
-        elif fusion_type == 'weighted_sum':
-            # Learnable weights initialized to 0.5 each
-            self.w_sam = nn.Parameter(torch.ones(1) * 0.5)
-            self.w_dino = nn.Parameter(torch.ones(1) * 0.5)
-        elif fusion_type == 'cross_attention':
-            self.query_proj = nn.Linear(sam_embed_dim, sam_embed_dim)
-            self.key_proj = nn.Linear(sam_embed_dim, sam_embed_dim)
-            self.value_proj = nn.Linear(sam_embed_dim, sam_embed_dim)
-            self.out_proj = nn.Linear(sam_embed_dim, sam_embed_dim)
-            self.scale = 1.0 / (sam_embed_dim ** 0.5)
             
     def extract_dinov2_features(self, x):
         """
         Extracts dense visual feature maps from DINOv2.
-        
-        Args:
-            x (torch.Tensor): Input image tensor of shape [B, 3, H, W]
-        Returns:
-            torch.Tensor: Feature map of shape [B, C_dino, H_patch, W_patch]
         """
+        # Normalize to standard ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+        dino_in = (x - mean) / std
+        
         with torch.no_grad():
-            # Get token embeddings from DINOv2
-            features = self.dinov2.forward_features(x)
-            patch_features = features[:, 1:, :] # Exclude CLS token, shape: [B, N, C_dino]
-            
+            features = self.dinov2.forward_features(dino_in)
+            if isinstance(features, dict):
+                patch_features = features["x_norm_patchtokens"]
+            else:
+                patch_features = features[:, 1:, :] # fallback
+                
         B, N, C = patch_features.shape
         grid_size = int(N ** 0.5)
         
@@ -68,52 +47,19 @@ class DinoV2Fusion(nn.Module):
         
     def forward(self, sam_embeddings, raw_images_for_dino):
         """
-        Fuses DINOv2 features with SAM embeddings.
-        
-        Args:
-            sam_embeddings (torch.Tensor): Visual embeddings from SAM image encoder, shape [B, 256, 64, 64]
-            raw_images_for_dino (torch.Tensor): Images resized for DINOv2, shape [B, 3, H, W]
-        Returns:
-            torch.Tensor: Fused visual embeddings of shape [B, 256, 64, 64]
+        Fuses DINOv2 features with SAM embeddings in a completely training-free manner.
         """
-        # 1. Extract raw DINOv2 features
-        dino_feats = self.extract_dinov2_features(raw_images_for_dino) # [B, dino_C, grid_size, grid_size]
+        # 1. Extract raw DINOv2 features [B, 384, grid_size, grid_size]
+        dino_feats = self.extract_dinov2_features(raw_images_for_dino)
         
-        # 2. Project to SAM embedding dimension (256)
-        dino_feats = self.dinov2_proj(dino_feats) # [B, 256, grid_size, grid_size]
+        # 2. Slice channels to match SAM embedding dimension (256) - Parameter-free!
+        dino_feats = dino_feats[:, :self.sam_embed_dim, :, :]
         
-        # 3. Bilinearly interpolate DINOv2 feature map to match SAM's 64x64 resolution
+        # 3. Spatial interpolation to match SAM's 64x64 resolution
         dino_feats = F.interpolate(dino_feats, size=(64, 64), mode='bilinear', align_corners=False)
         
-        # 4. Perform fusion
-        if self.fusion_type == 'concat':
-            concat_feats = torch.cat([sam_embeddings, dino_feats], dim=1) # [B, 512, 64, 64]
-            fused_embeddings = self.fusion_layer(concat_feats) # [B, 256, 64, 64]
-            
-        elif self.fusion_type == 'weighted_sum':
-            fused_embeddings = self.w_sam * sam_embeddings + self.w_dino * dino_feats
-            
-        elif self.fusion_type == 'cross_attention':
-            B, C, H, W = sam_embeddings.shape
-            # Flatten spatial dimensions: [B, 256, 4096] -> [B, 4096, 256]
-            sam_flat = sam_embeddings.view(B, C, -1).transpose(1, 2)
-            dino_flat = dino_feats.view(B, C, -1).transpose(1, 2)
-            
-            Q = self.query_proj(sam_flat) # [B, 4096, 256]
-            K = self.key_proj(dino_flat)  # [B, 4096, 256]
-            V = self.value_proj(dino_flat) # [B, 4096, 256]
-            
-            # Scaled Dot-Product Attention
-            attn_scores = torch.matmul(Q, K.transpose(1, 2)) * self.scale # [B, 4096, 4096]
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            
-            attn_out = torch.matmul(attn_weights, V) # [B, 4096, 256]
-            fused_flat = sam_flat + self.out_proj(attn_out) # Residual connection
-            
-            # Reshape back to 2D image layout
-            fused_embeddings = fused_flat.transpose(1, 2).view(B, C, H, W)
-            
-        else:
-            raise ValueError(f"Invalid fusion type: {self.fusion_type}")
-            
+        # 4. Perform weighted addition (alpha=0.3) - Parameter-free!
+        alpha = 0.3
+        fused_embeddings = (1.0 - alpha) * sam_embeddings + alpha * dino_feats
+        
         return fused_embeddings
